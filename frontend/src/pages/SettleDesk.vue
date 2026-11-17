@@ -43,7 +43,7 @@ function yuan(cents) {
   <div>
     <h1>归并台</h1>
     <p class="lead">对「待归并」正向与冲正跑一轮净额归并：配平落余额，无原单/超额进隔离。</p>
-    <p class="note-strip">本轮只处理状态为「待归并」的流水；隔离项不计入账户余额。</p>
+    <p class="note-strip">本轮只处理状态为「待归并」的流水；隔离项不计入账户余额。撤销的冲正单列在「撤销笔数 / 恢复额」，已从归并净额中剔除并回加余额。</p>
     <div class="row-actions">
       <button class="btn" :disabled="busy" @click="runSettle">跑净额归并</button>
     </div>
@@ -54,7 +54,7 @@ function yuan(cents) {
       <table>
         <thead>
           <tr>
-            <th>#</th><th>状态</th><th>正向</th><th>冲正</th><th>已归并</th><th>隔离</th><th>净额（元）</th><th>结束</th>
+            <th>#</th><th>状态</th><th>正向</th><th>冲正</th><th>已归并</th><th>隔离</th><th>撤销笔数</th><th>撤销恢复额（元）</th><th>净额（元）</th><th>结束</th>
           </tr>
         </thead>
         <tbody>
@@ -65,10 +65,12 @@ function yuan(cents) {
             <td>{{ r.reversal_count }}</td>
             <td>{{ r.settled_count }}</td>
             <td>{{ r.quarantine_count }}</td>
+            <td>{{ r.revoke_count }}</td>
+            <td>{{ yuan(r.revoke_restored_cents) }}</td>
             <td>{{ yuan(r.net_cents) }}</td>
             <td>{{ r.finished_at || '—' }}</td>
           </tr>
-          <tr v-if="!runs.length"><td colspan="8">尚无归并运行</td></tr>
+          <tr v-if="!runs.length"><td colspan="10">尚无归并运行</td></tr>
         </tbody>
       </table>
     </div>

@@ -24,6 +24,12 @@ def dashboard() -> dict:
         pending = conn.execute(
             "SELECT COUNT(*) AS c FROM ledger_entries WHERE status = '待归并'"
         ).fetchone()["c"]
+        revoked = conn.execute(
+            "SELECT COUNT(*) AS c FROM ledger_entries WHERE kind = '冲正' AND status = '已撤销'"
+        ).fetchone()["c"]
+        restored = conn.execute(
+            "SELECT COALESCE(SUM(restored_cents), 0) AS s FROM reverse_revocations"
+        ).fetchone()["s"]
         q = conn.execute("SELECT COUNT(*) AS c FROM quarantine_items").fetchone()["c"]
         bal = conn.execute("SELECT COALESCE(SUM(balance_cents), 0) AS s FROM accounts").fetchone()["s"]
         last = conn.execute("SELECT * FROM settle_runs ORDER BY id DESC LIMIT 1").fetchone()
@@ -32,6 +38,8 @@ def dashboard() -> dict:
             "正向笔数": fwd,
             "冲正笔数": rev,
             "待归并": pending,
+            "已撤销": revoked,
+            "撤销恢复额分": restored,
             "未平隔离": q,
             "余额合计分": bal,
             "最近归并": dict(last) if last else None,
@@ -66,7 +74,23 @@ def list_entries(kind: str | None = None) -> list[dict]:
                 ORDER BY e.id
                 """
             ).fetchall()
-        return rows_to_dicts(rows)
+        out = rows_to_dicts(rows)
+        # 正向：附带剩余敞口（已撤销冲正不计入已冲累计）
+        used_by_target = {
+            r["target_entry_key"]: r["s"]
+            for r in conn.execute(
+                """
+                SELECT target_entry_key, COALESCE(SUM(amount_cents), 0) AS s
+                FROM ledger_entries
+                WHERE kind = '冲正' AND status = '已归并' AND target_entry_key IS NOT NULL
+                GROUP BY target_entry_key
+                """
+            ).fetchall()
+        }
+        for e in out:
+            if e["kind"] == "正向":
+                e["remaining_cents"] = e["amount_cents"] - used_by_target.get(e["entry_key"], 0)
+        return out
 
 
 def list_quarantine() -> list[dict]:
@@ -84,9 +108,27 @@ def list_quarantine() -> list[dict]:
 
 def list_settle_runs() -> list[dict]:
     with connect() as conn:
-        return rows_to_dicts(
+        rows = rows_to_dicts(
             conn.execute("SELECT * FROM settle_runs ORDER BY id DESC").fetchall()
         )
+        for r in rows:
+            _attach_revoke_rollup(conn, r)
+        return rows
+
+
+def _attach_revoke_rollup(conn, run: dict) -> None:
+    """归并报告单列撤销笔数与恢复额（与撤销记录、冲正状态同源）。"""
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c, COALESCE(SUM(v.restored_cents), 0) AS s
+        FROM reverse_revocations v
+        JOIN ledger_entries e ON e.entry_key = v.reversal_key
+        WHERE e.settle_run_id = ?
+        """,
+        (run["id"],),
+    ).fetchone()
+    run["revoke_count"] = row["c"]
+    run["revoke_restored_cents"] = row["s"]
 
 
 def list_verify_reports() -> list[dict]:
@@ -97,7 +139,11 @@ def list_verify_reports() -> list[dict]:
 
 
 def run_settle() -> dict:
-    """底座冒烟：按账户汇总正向−已匹配冲正；无原单/超额冲正进隔离；余额写账户。"""
+    """按账户汇总正向−已匹配冲正；无原单/超额冲正进隔离；增量累加账户余额。
+
+    余额采用增量记账：本轮净额只叠加到既有余额上。撤销冲正时已把恢复额
+    回加余额，故后续归并不能用「本轮净额覆盖写」抹掉撤销的恢复。
+    """
     with connect() as conn:
         now = _now()
         cur = conn.execute(
@@ -119,10 +165,27 @@ def run_settle() -> dict:
                 "SELECT * FROM ledger_entries WHERE kind = '冲正' AND status = '待归并' ORDER BY id"
             ).fetchall()
         )
-        fwd_by_key = {f["entry_key"]: f for f in forwards}
+        # 冲正可挂到本轮待归并正向，也可挂到历史已归并正向（撤销恢复的敞口可再被冲）
+        all_forwards = {
+            f["entry_key"]: f
+            for f in rows_to_dicts(
+                conn.execute("SELECT * FROM ledger_entries WHERE kind = '正向'").fetchall()
+            )
+        }
 
-        # 每个正向已占用冲正额度
-        used: dict[str, int] = {f["entry_key"]: 0 for f in forwards}
+        # 每个正向已占用冲正额度：含历史已归并冲正（不含已撤销）
+        used: dict[str, int] = {}
+        for r in conn.execute(
+            """
+            SELECT target_entry_key, COALESCE(SUM(amount_cents), 0) AS s
+            FROM ledger_entries
+            WHERE kind = '冲正' AND status = '已归并' AND target_entry_key IS NOT NULL
+            GROUP BY target_entry_key
+            """
+        ).fetchall():
+            used[r["target_entry_key"]] = r["s"]
+        for f in forwards:
+            used.setdefault(f["entry_key"], 0)
         settled = 0
         quarantined = 0
         account_net: dict[int, int] = {}
@@ -132,7 +195,7 @@ def run_settle() -> dict:
 
         for r in reversals:
             target = r.get("target_entry_key")
-            if not target or target not in fwd_by_key:
+            if not target or target not in all_forwards:
                 conn.execute(
                     """
                     INSERT INTO quarantine_items(
@@ -148,7 +211,7 @@ def run_settle() -> dict:
                 quarantined += 1
                 continue
 
-            fwd = fwd_by_key[target]
+            fwd = all_forwards[target]
             if fwd["account_id"] != r["account_id"]:
                 conn.execute(
                     """
@@ -165,7 +228,7 @@ def run_settle() -> dict:
                 quarantined += 1
                 continue
 
-            remain = fwd["amount_cents"] - used[target]
+            remain = fwd["amount_cents"] - used.get(target, 0)
             if r["amount_cents"] > remain:
                 conn.execute(
                     """
@@ -200,7 +263,7 @@ def run_settle() -> dict:
         net_total = 0
         for acc_id, net in account_net.items():
             conn.execute(
-                "UPDATE accounts SET balance_cents = ?, last_settle_run_id = ? WHERE id = ?",
+                "UPDATE accounts SET balance_cents = balance_cents + ?, last_settle_run_id = ? WHERE id = ?",
                 (net, run_id, acc_id),
             )
             net_total += net
@@ -238,7 +301,9 @@ def get_settle_run(run_id: int) -> dict:
         row = conn.execute("SELECT * FROM settle_runs WHERE id = ?", (run_id,)).fetchone()
         if not row:
             raise HTTPException(404, "归并运行不存在")
-        return dict(row)
+        out = dict(row)
+        _attach_revoke_rollup(conn, out)
+        return out
 
 
 def run_verify(settle_run_id: int | None = None) -> dict:
@@ -272,8 +337,8 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             "SELECT COALESCE(SUM(balance_cents), 0) AS s FROM accounts WHERE last_settle_run_id = ?",
             (settle_run_id,),
         ).fetchone()["s"]
-        # 账户余额合计可能含历史；底座约定：互证看「本轮触及账户余额合计」vs 本轮流水净额
-        # 简化：用全部账户余额 vs 全部已归并净额（多轮后仍应一致若每轮覆盖写）
+        # 账户余额为增量累加；被撤销冲正的恢复额已即时回加余额，
+        # 因此「全量已归并流水净额」与「全量账户余额」始终应对齐。
         all_bal = conn.execute("SELECT COALESCE(SUM(balance_cents), 0) AS s FROM accounts").fetchone()["s"]
         q_count = conn.execute(
             "SELECT COUNT(*) AS c FROM quarantine_items WHERE settle_run_id = ?",
@@ -289,6 +354,19 @@ def run_verify(settle_run_id: int | None = None) -> dict:
         ).fetchone()["s"]
         all_ledger_net = all_fwd - all_rev
 
+        # 撤销单一来源：撤销笔数、恢复额、及被撤销冲正挂靠的入账轮
+        revoke_rows = conn.execute(
+            """
+            SELECT v.*, e.settle_run_id AS reversal_settle_run_id
+            FROM reverse_revocations v
+            LEFT JOIN ledger_entries e ON e.entry_key = v.reversal_key
+            ORDER BY v.id
+            """
+        ).fetchall()
+        revoked_count = len(revoke_rows)
+        revoked_restored = sum(r["restored_cents"] for r in revoke_rows)
+        run_revokes = [r for r in revoke_rows if r["reversal_settle_run_id"] == settle_run_id]
+
         consistent = 1 if all_ledger_net == all_bal else 0
         detail = {
             "本轮正向分": fwd_sum,
@@ -298,14 +376,25 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             "全量流水净额分": all_ledger_net,
             "全量账户余额分": all_bal,
             "本轮隔离数": q_count,
+            "撤销笔数": revoked_count,
+            "本轮撤销笔数": len(run_revokes),
+            "撤销恢复额分": revoked_restored,
+            "本轮撤销恢复额分": sum(r["restored_cents"] for r in run_revokes),
+            "非归并状态冲正分": conn.execute(
+                """
+                SELECT COALESCE(SUM(amount_cents), 0) AS s FROM ledger_entries
+                WHERE kind = '冲正' AND status NOT IN ('已归并', '已撤销')
+                """
+            ).fetchone()["s"],
         }
         now = _now()
         cur = conn.execute(
             """
             INSERT INTO verify_reports(
               settle_run_id, ledger_net_cents, balance_sum_cents,
-              quarantine_count, consistent, detail_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+              quarantine_count, consistent, detail_json,
+              revoke_count, revoke_restored_cents, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 settle_run_id,
@@ -314,6 +403,8 @@ def run_verify(settle_run_id: int | None = None) -> dict:
                 q_count,
                 consistent,
                 json.dumps(detail, ensure_ascii=False),
+                revoked_count,
+                revoked_restored,
                 now,
             ),
         )

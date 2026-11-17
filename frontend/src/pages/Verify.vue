@@ -55,7 +55,7 @@ function yuan(cents) {
       <table>
         <thead>
           <tr>
-            <th>#</th><th>归并#</th><th>流水净额</th><th>余额合计</th><th>隔离数</th><th>一致</th><th>时间</th>
+            <th>#</th><th>归并#</th><th>流水净额</th><th>余额合计</th><th>隔离数</th><th>撤销笔数</th><th>撤销恢复额</th><th>一致</th><th>时间</th>
           </tr>
         </thead>
         <tbody>
@@ -65,6 +65,8 @@ function yuan(cents) {
             <td>{{ yuan(r.ledger_net_cents) }}</td>
             <td>{{ yuan(r.balance_sum_cents) }}</td>
             <td>{{ r.quarantine_count }}</td>
+            <td>{{ r.revoke_count }}</td>
+            <td>{{ yuan(r.revoke_restored_cents) }}</td>
             <td>
               <span class="tag" :class="r.consistent ? 'on' : 'bad'">
                 {{ r.consistent ? '是' : '否' }}
@@ -72,7 +74,7 @@ function yuan(cents) {
             </td>
             <td>{{ r.created_at }}</td>
           </tr>
-          <tr v-if="!rows.length"><td colspan="7">尚无报告</td></tr>
+          <tr v-if="!rows.length"><td colspan="9">尚无报告</td></tr>
         </tbody>
       </table>
     </div>

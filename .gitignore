@@ -5,3 +5,6 @@ backend/data_test/
 frontend/node_modules/
 frontend/dist/
 *.db
+
+backend/.venv/
+backend/data_test*/

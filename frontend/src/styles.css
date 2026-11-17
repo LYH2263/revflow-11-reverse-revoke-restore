@@ -373,6 +373,18 @@ tbody tr:hover { background: rgba(36, 87, 197, 0.04); }
   background: #fee4e2;
   color: var(--danger);
 }
+.tag.void {
+  background: #ede9fe;
+  color: #5b21b6;
+  text-decoration: line-through;
+}
+.mono { font-family: var(--mono); font-size: 12px; }
+.dim { color: var(--muted); }
+.evidence { display: flex; flex-direction: column; gap: 2px; }
+button.small {
+  font-size: 12px;
+  padding: 6px 11px;
+}
 
 .btn {
   appearance: none;

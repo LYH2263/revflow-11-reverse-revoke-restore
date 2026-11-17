@@ -56,14 +56,61 @@ CREATE TABLE IF NOT EXISTS verify_reports (
   quarantine_count INTEGER NOT NULL,
   consistent INTEGER NOT NULL,
   detail_json TEXT NOT NULL,
+  revoke_count INTEGER NOT NULL DEFAULT 0,
+  revoke_restored_cents INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reverse_revocations (
+  id INTEGER PRIMARY KEY,
+  reversal_key TEXT NOT NULL UNIQUE REFERENCES ledger_entries(entry_key),
+  reversal_id INTEGER NOT NULL,
+  target_entry_key TEXT NOT NULL,
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  restored_cents INTEGER NOT NULL,
+  settle_run_id INTEGER,
+  run_id TEXT NOT NULL,
+  revoked_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS reverse_revocations_immutable
+BEFORE UPDATE ON reverse_revocations
+BEGIN
+  SELECT RAISE(ABORT, '撤销记录不可变');
+END;
+CREATE TRIGGER IF NOT EXISTS reverse_revocations_no_delete
+BEFORE DELETE ON reverse_revocations
+BEGIN
+  SELECT RAISE(ABORT, '撤销记录不可删');
+END;
+CREATE INDEX IF NOT EXISTS idx_reverse_revocations_target
+  ON reverse_revocations(target_entry_key);
 """
+
+
+def migrate_db(conn) -> None:
+    """为已存在的库补「已撤销」冲正快照列（幂等）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ledger_entries)").fetchall()}
+    if "revoked_at" not in cols:
+        conn.execute("ALTER TABLE ledger_entries ADD COLUMN revoked_at TEXT")
+    if "revoked_run_id" not in cols:
+        conn.execute("ALTER TABLE ledger_entries ADD COLUMN revoked_run_id TEXT")
+    if "revoked_cents" not in cols:
+        conn.execute("ALTER TABLE ledger_entries ADD COLUMN revoked_cents INTEGER")
+    rcols = {r["name"] for r in conn.execute("PRAGMA table_info(verify_reports)").fetchall()}
+    if "revoke_count" not in rcols:
+        conn.execute(
+            "ALTER TABLE verify_reports ADD COLUMN revoke_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "revoke_restored_cents" not in rcols:
+        conn.execute(
+            "ALTER TABLE verify_reports ADD COLUMN revoke_restored_cents INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        migrate_db(conn)
+        conn.commit()
         n = conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()["c"]
         if n:
             return
